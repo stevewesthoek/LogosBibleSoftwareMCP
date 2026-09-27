@@ -25,6 +25,7 @@ import { searchCatalog, getResourceTypeSummary, typeLabel } from "./services/cat
 import { captureLogosPanel, getLogosWindowTitles } from "./services/screenshot-capture.js";
 import type { CaptureToolType } from "./types.js";
 import { registerProviderTools } from "./tools/provider-tools.js";
+import { createRemoteReadOnlyMcpServer } from "./tools/remote-profile.js";
 import { startConfiguredTransport } from "./transports/start.js";
 
 function text(s: string) {
@@ -710,7 +711,17 @@ export function createMcpServer() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  startConfiguredTransport(createMcpServer).catch((error) => {
+  const profile = process.env.LOGOS_MCP_PROFILE ?? "full";
+  const factory = profile === "full"
+    ? createMcpServer
+    : profile === "remote-read-only"
+      ? createRemoteReadOnlyMcpServer
+      : undefined;
+  if (!factory) {
+    console.error("LOGOS_MCP_PROFILE must be 'full' or 'remote-read-only'.");
+    process.exit(1);
+  }
+  startConfiguredTransport(factory).catch((error) => {
     console.error("Fatal error:", error instanceof Error ? error.message : "Server startup failed.");
     process.exit(1);
   });

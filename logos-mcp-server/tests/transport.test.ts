@@ -5,8 +5,18 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { request, type Server as HttpServer } from "node:http";
 import { createMcpServer } from "../src/index.js";
 import { startHttpTransport } from "../src/transports/start.js";
+import { createRemoteReadOnlyMcpServer } from "../src/tools/remote-profile.js";
 
 const servers: HttpServer[] = [];
+
+function withoutRetrievalTimes(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutRetrievalTimes);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "retrievedAt")
+      .map(([key, child]) => [key, withoutRetrievalTimes(child)]));
+  }
+  return value;
+}
 
 function getStatus(url: URL, headers: Record<string, string>): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -48,6 +58,81 @@ describe("MCP transports", () => {
       expect(names).toContain("get_study_context");
       expect(names).toContain("search_personal_studies");
       expect(names).toContain("health");
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("exposes exactly the read-only consumer allowlist over Streamable HTTP", async () => {
+    const server = await startHttpTransport(createRemoteReadOnlyMcpServer, { port: 0 });
+    servers.push(server);
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("HTTP server did not bind to a TCP port.");
+
+    const client = new Client({ name: "logos-provider-remote-profile-test", version: "1.0.0" });
+    try {
+      await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`)));
+      const listed = await client.listTools();
+      expect(listed.tools.map((tool) => tool.name).sort()).toEqual([
+        "get_study_context",
+        "health",
+        "search_personal_studies",
+      ]);
+      expect(listed.tools.every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
+
+      const health = await client.callTool({ name: "health", arguments: {} });
+      const serializedHealth = JSON.stringify(health);
+      expect(health.structuredContent).toMatchObject({ provider: "logos-knowledge-provider", readOnly: true });
+      expect(serializedHealth).not.toMatch(/\/Users\/|\/home\/|\/Library\/Application Support\/|BIBLIA_API_KEY|LOGOS_DATA_DIR/);
+
+      const result = await client.callTool({
+        name: "search_personal_studies",
+        arguments: { query: "codex-remote-profile-test-sentinel-9a6c2c" },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toHaveProperty("completeness");
+      expect(result.structuredContent).toHaveProperty("warnings");
+      expect(JSON.stringify(result)).not.toMatch(/\/Users\/|\/home\/|\/Library\/Application Support\/|BIBLIA_API_KEY|LOGOS_DATA_DIR/);
+
+      const stdio = new StdioClientTransport({
+        command: process.execPath,
+        args: ["--import", "tsx", "src/index.ts"],
+        cwd: process.cwd(),
+        env: { ...process.env, LOGOS_MCP_PROFILE: "remote-read-only" },
+        stderr: "pipe",
+      });
+      const stdioClient = new Client({ name: "logos-provider-equivalence-test", version: "1.0.0" });
+      try {
+        await stdioClient.connect(stdio);
+        const stdioResult = await stdioClient.callTool({
+          name: "search_personal_studies",
+          arguments: { query: "codex-remote-profile-test-sentinel-9a6c2c" },
+        });
+        expect(withoutRetrievalTimes(stdioResult.structuredContent)).toEqual(withoutRetrievalTimes(result.structuredContent));
+      } finally {
+        await stdioClient.close();
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("selects the restricted profile for stdio without changing the default full profile", async () => {
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["--import", "tsx", "src/index.ts"],
+      cwd: process.cwd(),
+      env: { ...process.env, LOGOS_MCP_PROFILE: "remote-read-only" },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "logos-provider-remote-stdio-test", version: "1.0.0" });
+    try {
+      await client.connect(transport);
+      expect((await client.listTools()).tools.map((tool) => tool.name).sort()).toEqual([
+        "get_study_context",
+        "health",
+        "search_personal_studies",
+      ]);
     } finally {
       await client.close();
     }

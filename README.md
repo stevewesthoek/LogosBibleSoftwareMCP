@@ -92,7 +92,7 @@ cd logos-mcp-server
 LOGOS_MCP_TRANSPORT=http LOGOS_MCP_HTTP_HOST=127.0.0.1 LOGOS_MCP_HTTP_PORT=3123 node dist/index.js
 ```
 
-The endpoint is `http://127.0.0.1:3123/mcp`. The server rejects non-loopback bind addresses. For a remote client, use an approved authenticated tunnel such as SSH or Tailscale; do not expose the endpoint directly to a network.
+The endpoint is `http://127.0.0.1:3123/mcp`. The server rejects non-loopback bind addresses. For remote MCP clients, set `LOGOS_MCP_PROFILE=remote-read-only` to expose only `health`, `get_study_context`, and `search_personal_studies`, then connect through an approved authenticated tunnel; do not expose the endpoint directly to a network. See [ChatGPT and remote MCP setup](logos-mcp-server/docs/chatgpt.md) for the private ChatGPT flow and privacy boundaries.
 
 ## Using with Claude Desktop or Cowork
 

@@ -74,16 +74,20 @@ export function getProviderHealthReport() {
 }
 
 export function registerProviderTools(server: McpServer): void {
-  server.tool(
+  server.registerTool(
     "get_study_context",
-    "Retrieve a bounded, provenance-preserving study context from Logos personal study data, library metadata, and optionally Biblia-backed Bible text. Provide a passage, a query, or both.",
     {
-      passage: z.string().max(120).optional().describe("Canonical Bible reference or passage range"),
-      query: z.string().max(300).optional().describe("Topic or terms to search in Logos study data"),
-      include: z.array(z.enum(["notes", "highlights", "clippings", "bible", "library"])).max(5).optional()
-        .describe("Sources to include; defaults to personal notes, highlights, and clippings"),
-      limit: z.number().int().min(1).max(50).optional().describe("Maximum combined study items (default 24)"),
-      bible: z.string().max(30).optional().describe("Biblia translation code when bible is included"),
+      title: "Get Logos study context",
+      description: "Retrieve the user's relevant personal Logos study material for a Bible passage or topic, including notes, highlights, and clippings where available. Optional library metadata and Biblia text may be included. Results preserve provenance, completeness, and warnings.",
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        passage: z.string().max(120).optional().describe("Canonical Bible reference or passage range"),
+        query: z.string().max(300).optional().describe("Topic or terms to search in Logos study data"),
+        include: z.array(z.enum(["notes", "highlights", "clippings", "bible", "library"])).max(5).optional()
+          .describe("Sources to include; defaults to personal notes, highlights, and clippings"),
+        limit: z.number().int().min(1).max(50).optional().describe("Maximum combined study items (default 24)"),
+        bible: z.string().max(30).optional().describe("Biblia translation code when bible is included"),
+      },
     },
     async ({ passage, query, include, limit, bible }) => {
       try {
@@ -94,15 +98,19 @@ export function registerProviderTools(server: McpServer): void {
     },
   );
 
-  server.tool(
+  server.registerTool(
     "search_personal_studies",
-    "Search Logos notes, highlights, and clippings with optional canonical passage scope. Results retain source IDs, resource identity, provenance, completeness, and warnings.",
     {
-      query: z.string().min(1).max(300).describe("Words or phrase to search"),
-      passage: z.string().max(120).optional().describe("Optionally scope results to a canonical Bible passage"),
-      sources: z.array(z.enum(["notes", "highlights", "clippings"])).min(1).max(3).optional()
-        .describe("Personal study sources to search; defaults to all three"),
-      limit: z.number().int().min(1).max(50).optional().describe("Maximum combined study items (default 24)"),
+      title: "Search personal Logos studies",
+      description: "Search the user's own Logos notes, highlights, and clippings for a topic, with optional Bible passage scope. Returns bounded results with source type, useful provenance, completeness, and warnings.",
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      inputSchema: {
+        query: z.string().min(1).max(300).describe("Words or phrase to search"),
+        passage: z.string().max(120).optional().describe("Optionally scope results to a canonical Bible passage"),
+        sources: z.array(z.enum(["notes", "highlights", "clippings"])).min(1).max(3).optional()
+          .describe("Personal study sources to search; defaults to all three"),
+        limit: z.number().int().min(1).max(50).optional().describe("Maximum combined study items (default 24)"),
+      },
     },
     async ({ query, passage, sources, limit }) => {
       try {
@@ -113,10 +121,14 @@ export function registerProviderTools(server: McpServer): void {
     },
   );
 
-  server.tool(
+  server.registerTool(
     "health",
-    "Report path-free provider capabilities and read-only data-source availability.",
-    {},
+    {
+      title: "Check Logos provider availability",
+      description: "Report whether the local Logos provider and its read-only data sources are available. Use only when connection status is requested or retrieval fails; normal searches do not need a health check first.",
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+      inputSchema: {},
+    },
     async () => jsonResult(getProviderHealthReport()),
   );
 }
