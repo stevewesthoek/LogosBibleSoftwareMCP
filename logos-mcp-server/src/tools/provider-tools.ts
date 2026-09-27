@@ -3,7 +3,19 @@ import Database from "better-sqlite3";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { BIBLIA_API_KEY, DB_PATHS, LOGOS_CATALOG_DIR, LOGOS_DATA_DIR } from "../config.js";
-import { getStudyContext, searchPersonalStudies } from "../services/knowledge-provider.js";
+import { getStudyContext, searchPersonalStudies, type StudyContextInput, type SearchPersonalStudiesInput } from "../services/knowledge-provider.js";
+
+export interface ProviderToolHandlers {
+  getStudyContext: (input: StudyContextInput) => ReturnType<typeof getStudyContext>;
+  searchPersonalStudies: (input: SearchPersonalStudiesInput) => ReturnType<typeof searchPersonalStudies>;
+  getHealthReport: typeof getProviderHealthReport;
+}
+
+const DEFAULT_HANDLERS: ProviderToolHandlers = {
+  getStudyContext,
+  searchPersonalStudies,
+  getHealthReport: getProviderHealthReport,
+};
 
 function jsonResult(value: unknown) {
   return {
@@ -73,7 +85,7 @@ export function getProviderHealthReport() {
   };
 }
 
-export function registerProviderTools(server: McpServer): void {
+export function registerProviderTools(server: McpServer, handlers: ProviderToolHandlers = DEFAULT_HANDLERS): void {
   server.registerTool(
     "get_study_context",
     {
@@ -91,7 +103,7 @@ export function registerProviderTools(server: McpServer): void {
     },
     async ({ passage, query, include, limit, bible }) => {
       try {
-        return jsonResult(await getStudyContext({ passage, query, include, limit, bible }));
+        return jsonResult(await handlers.getStudyContext({ passage, query, include, limit, bible }));
       } catch (error) {
         return jsonError(error);
       }
@@ -114,7 +126,7 @@ export function registerProviderTools(server: McpServer): void {
     },
     async ({ query, passage, sources, limit }) => {
       try {
-        return jsonResult(await searchPersonalStudies({ query, passage, sources, limit }));
+        return jsonResult(await handlers.searchPersonalStudies({ query, passage, sources, limit }));
       } catch (error) {
         return jsonError(error);
       }
@@ -129,6 +141,6 @@ export function registerProviderTools(server: McpServer): void {
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
       inputSchema: {},
     },
-    async () => jsonResult(getProviderHealthReport()),
+    async () => jsonResult(handlers.getHealthReport()),
   );
 }

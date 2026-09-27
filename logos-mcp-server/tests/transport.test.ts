@@ -6,6 +6,7 @@ import { request, type Server as HttpServer } from "node:http";
 import { createMcpServer } from "../src/index.js";
 import { startHttpTransport } from "../src/transports/start.js";
 import { createRemoteReadOnlyMcpServer } from "../src/tools/remote-profile.js";
+import { getProviderHealthReport, type ProviderToolHandlers } from "../src/tools/provider-tools.js";
 
 const servers: HttpServer[] = [];
 
@@ -111,6 +112,47 @@ describe("MCP transports", () => {
         expect(withoutRetrievalTimes(stdioResult.structuredContent)).toEqual(withoutRetrievalTimes(result.structuredContent));
       } finally {
         await stdioClient.close();
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("preserves partial and unknown completeness warnings in remote responses", async () => {
+    const handlers: ProviderToolHandlers = {
+      getStudyContext: async (input) => ({
+        query: input.query,
+        items: [],
+        completeness: "unknown",
+        warnings: [{ code: "fixture_context_unknown", source: "note" }],
+      }),
+      searchPersonalStudies: async (input) => ({
+        query: input.query,
+        items: [],
+        completeness: input.query.includes("unknown") ? "unknown" : "partial",
+        warnings: [{ code: input.query.includes("unknown") ? "fixture_unknown" : "fixture_partial", source: "note" }],
+      }),
+      getHealthReport: getProviderHealthReport,
+    };
+    const server = await startHttpTransport(() => createRemoteReadOnlyMcpServer(handlers), { port: 0 });
+    servers.push(server);
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("HTTP server did not bind to a TCP port.");
+
+    const client = new Client({ name: "logos-provider-completeness-test", version: "1.0.0" });
+    try {
+      await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`)));
+      for (const [query, completeness, code] of [
+        ["fixture partial", "partial", "fixture_partial"],
+        ["fixture unknown", "unknown", "fixture_unknown"],
+      ] as const) {
+        const response = await client.callTool({ name: "search_personal_studies", arguments: { query } });
+        expect(response.structuredContent).toEqual({
+          query,
+          items: [],
+          completeness,
+          warnings: [{ code, source: "note" }],
+        });
       }
     } finally {
       await client.close();
