@@ -1,10 +1,12 @@
-# Logos Bible Software MCP Server + Socratic Bible Study Agent
+# Logos Knowledge Provider + Socratic Bible Study Agent
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that connects [Claude Code](https://docs.anthropic.com/en/docs/claude-code) to [Logos Bible Software](https://www.logos.com/), plus a custom Socratic Bible study agent that uses these tools for guided theological dialogue.
+A consumer-agnostic, read-only [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) provider for live [Logos Bible Software](https://www.logos.com/) study data. Brain, ChatGPT, Codex, Claude, and other MCP clients can use the same provider contract over stdio or local Streamable HTTP. The repository also includes a Socratic Bible study agent for Claude Code.
 
 ## What This Does
 
-- **24 MCP tools** that let Claude read Bible text, search Scripture, navigate Logos, access your notes/highlights/favorites/clippings, check reading plans, explore word studies and factbook entries, search your library catalog, open commentaries and lexicons, run cross-resource searches, capture Logos panels for vision reading, check what Logos is showing, and diagnose environment issues
+- **27 MCP tools**: all 24 upstream tools plus `get_study_context`, `search_personal_studies`, and path-free `health`; the two provider tools return normalized results with provenance, completeness, and warnings
+- **Read-only Logos data access**: personal study data and the library catalog are queried live; the provider does not mirror Logos data into Mind or write to Logos databases or user content. Preserved upstream UI tools can still open or navigate visible Logos windows
+- **Two transports**: stdio for local MCP clients and Streamable HTTP bound to loopback for local integrations and approved tunnels
 - **A Socratic Bible Study agent** that guides you through Scripture using questions (not lectures), welcoming any denominational background, with four questioning layers: Observation, Interpretation, Correlation, and Application
 - **A QA Tool Tester agent** that systematically exercises all tools and produces a pass/fail/skip report
 
@@ -13,20 +15,21 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 | Requirement | Details |
 |-------------|---------|
 | **macOS or Windows** | macOS uses the `open` command and AppleScript; Windows uses the registered `logos4:` protocol handler and `tasklist` |
-| **Logos Bible Software** | macOS: `/Applications/Logos.app` (tested with v48); Windows: standard install under `%LOCALAPPDATA%\Logos` |
-| **Node.js** | v18+ (v23+ recommended for native `fetch` support) |
-| **Claude Code** | Anthropic's CLI tool ([install guide](https://docs.anthropic.com/en/docs/claude-code)) |
-| **Biblia API Key** | Free key from [bibliaapi.com](https://bibliaapi.com/) |
-| **Xcode Command Line Tools** | `clang` is required to compile the window-capture helper used by `capture_panel_screenshot` (install: `xcode-select --install`) |
-| **macOS permissions** | Screen Recording permission for your terminal app (System Settings → Privacy & Security → Screen Recording) is required for screenshots; Automation/Accessibility permission is prompted on first AppleScript use (detecting whether Logos is running) |
+| **Logos Bible Software** | macOS: `/Applications/Logos.app` (live smoke-tested with v53.1.0.0002); Windows: standard install under `%LOCALAPPDATA%\Logos` |
+| **Node.js** | Node.js 24 LTS (`>=24 <25`); see `logos-mcp-server/.nvmrc` |
+| **MCP client** | Any MCP client that supports stdio or Streamable HTTP; Claude Code setup is shown below |
+| **Biblia API Key** | Optional; needed only for Biblia-backed Bible-text/search tools. Get a free key from [bibliaapi.com](https://bibliaapi.com/) |
+| **Xcode Command Line Tools** | Optional; `clang` is required only for the macOS `capture_panel_screenshot` helper (`xcode-select --install`) |
+| **macOS permissions** | Screen Recording permission is needed for screenshots; Automation/Accessibility permission may be prompted for Logos UI tools |
 
 ## Setup
 
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/robrawks/LogosBibleSoftwareMCP.git
+git clone https://github.com/stevewesthoek/LogosBibleSoftwareMCP.git
 cd LogosBibleSoftwareMCP
+git remote add upstream https://github.com/robrawks/LogosBibleSoftwareMCP.git
 ```
 
 ### 2. Install dependencies and build
@@ -72,7 +75,24 @@ BIBLIA_API_KEY=your_api_key_here
 claude
 ```
 
-Once Claude Code starts, type `/mcp` to check that the "logos" server appears with 24 tools.
+Once Claude Code starts, type `/mcp` to check that the "logos" server appears with 27 tools.
+
+### Consumer-agnostic study tools
+
+`get_study_context` combines bounded notes, highlights, clippings, and optional library/Biblia results for a passage or topic. `search_personal_studies` searches personal study data with optional passage scope. Results retain Logos source IDs, resource identity, canonical references where available, retrieval time, completeness (`complete`, `partial`, or `unknown`), and bounded warnings. Unknown or unsupported references are reported instead of silently mapped.
+
+The normalized provider model lives independently of MCP transport and client configuration. Existing upstream tools remain registered for compatibility. See the [provider architecture](https://github.com/stevewesthoek/brain/blob/2314628e01a4ebb46ec52f26824377540dc3c136/operations/specs/logos-knowledge-provider-architecture.md), [implementation plan](https://github.com/stevewesthoek/brain/blob/2314628e01a4ebb46ec52f26824377540dc3c136/operations/plans/logos-knowledge-provider-implementation-plan.md), and [upstream update runbook](https://github.com/stevewesthoek/brain/blob/2314628e01a4ebb46ec52f26824377540dc3c136/operations/runbooks/logos-mcp-upstream-update.md).
+
+### Streamable HTTP
+
+stdio remains the default. To run Streamable HTTP on loopback:
+
+```bash
+cd logos-mcp-server
+LOGOS_MCP_TRANSPORT=http LOGOS_MCP_HTTP_HOST=127.0.0.1 LOGOS_MCP_HTTP_PORT=3123 node dist/index.js
+```
+
+The endpoint is `http://127.0.0.1:3123/mcp`. The server rejects non-loopback bind addresses. For a remote client, use an approved authenticated tunnel such as SSH or Tailscale; do not expose the endpoint directly to a network.
 
 ## Using with Claude Desktop or Cowork
 
@@ -160,7 +180,15 @@ Tools for troubleshooting and verifying your setup
 
 | Tool | What it does |
 |------|-------------|
-| `diagnose` | Checks Logos data paths, database availability, and API configuration |
+| `diagnose` | Checks path-free Logos database availability and API configuration |
+
+### Knowledge Provider
+
+| Tool | What it does |
+|------|-------------|
+| `get_study_context` | Combines relevant personal study data and optional Bible/library results in a normalized envelope |
+| `search_personal_studies` | Searches notes, highlights, and clippings with optional canonical passage scope |
+| `health` | Reports path-free provider capabilities and data-source availability |
 
 ## Using the Socratic Bible Study Agent
 
@@ -198,10 +226,13 @@ LogosBibleSoftwareMCP/
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── src/
-│   │   ├── index.ts                   # MCP server entry point (24 tools)
+│   │   ├── index.ts                   # Shared MCP tool registration and entry point (27 tools)
 │   │   ├── cli.ts                     # Diagnose CLI entry point
 │   │   ├── config.ts                  # Paths, API config, constants
 │   │   ├── types.ts                   # Shared TypeScript types
+│   │   ├── domain/                     # Canonical references and normalized study-item contracts
+│   │   ├── tools/                      # Consumer-agnostic provider MCP tools
+│   │   ├── transports/                 # stdio and Streamable HTTP startup
 │   │   └── services/
 │   │       ├── reference-parser.ts    # Bible reference normalization
 │   │       ├── biblia-api.ts          # Biblia.com REST API client
@@ -249,7 +280,7 @@ Each Logos install uses a randomly named instance directory (e.g. `a3wo155q.w14`
 
 ## Troubleshooting
 
-**Quick diagnostic check** - Run `cd logos-mcp-server && npm run diagnose` to verify all data paths, databases, and API configuration before launching Claude Code.
+**Quick diagnostic check** - Run `cd logos-mcp-server && npm run diagnose` to verify database availability and API configuration before launching an MCP client. MCP diagnostic tools report status without exposing local paths.
 
 **"BIBLIA_API_KEY is not set"** - Get a free key at [bibliaapi.com](https://bibliaapi.com/) and add it to the `env` block in `.mcp.json`. Bible-text tools need it, but Logos-local tools (notes, highlights, clippings, library catalog) work without it.
 

@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "provider": "logos-knowledge-provider",
+  "providerVersion": "1.1.0",
+  "upstream": {
+    "repository": "https://github.com/robrawks/LogosBibleSoftwareMCP.git",
+    "baselineRevision": "6d4a4144df10b18516d78da34c10605ce265a72f",
+    "productionTracksUpstreamMain": false
+  },
+  "maintainedFork": {
+    "repository": "https://github.com/stevewesthoek/LogosBibleSoftwareMCP.git",
+    "remoteName": "origin",
+    "upstreamRemoteName": "upstream"
+  },
+  "runtime": {
+    "node": ">=24 <25",
+    "validatedNode": "24.16.0",
+    "operatingSystems": ["macOS", "Windows"]
+  },
+  "transports": {
+    "stdio": true,
+    "streamableHttp": {
+      "enabled": true,
+      "defaultBind": "127.0.0.1",
+      "path": "/mcp",
+      "requiresApprovedTunnelForRemoteAccess": true
+    }
+  },
+  "readOnly": true,
+  "readOnlyScope": "No writes to Logos databases or user-created content; preserved upstream UI tools may change the visible Logos window state.",
+  "tools": {
+    "upstreamToolsPreserved": 24,
+    "providerTools": ["get_study_context", "search_personal_studies", "health"]
+  },
+  "contract": {
+    "completenessValues": ["complete", "partial", "unknown"],
+    "provenanceRequired": true,
+    "logosBibleReferenceNormalizationIsTested": true,
+    "fullCopyrightedResourceBulkExtractionAssumed": false
+  },
+  "validation": {
+    "validatedOn": "2026-09-27",
+    "build": "passed",
+    "automatedTestsPassed": 185,
+    "mcpToolCount": 27,
+    "productionDependencyAudit": "zero vulnerabilities",
+    "localLogosSmoke": {
+      "operatingSystem": "macOS",
+      "logosVersion": "53.1.0.0002",
+      "otAndNtAnchoredNotes": true,
+      "noteBackedHighlights": true,
+      "clippings": true,
+      "stdioAndStreamableHttp": true,
+      "logosDatabaseFilesUnchanged": true
+    }
+  }
+}
