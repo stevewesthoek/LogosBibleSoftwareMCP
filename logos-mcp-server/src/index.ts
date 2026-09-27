@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { existsSync } from "fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { SERVER_NAME, SERVER_VERSION, LOGOS_DATA_DIR, LOGOS_CATALOG_DIR, DB_PATHS, BIBLIA_API_KEY } from "./config.js";
 
@@ -23,6 +24,8 @@ import {
 import { searchCatalog, getResourceTypeSummary, typeLabel } from "./services/catalog-reader.js";
 import { captureLogosPanel, getLogosWindowTitles } from "./services/screenshot-capture.js";
 import type { CaptureToolType } from "./types.js";
+import { registerProviderTools } from "./tools/provider-tools.js";
+import { startConfiguredTransport } from "./transports/start.js";
 
 function text(s: string) {
   return { content: [{ type: "text" as const, text: s }] };
@@ -64,7 +67,7 @@ function canonicalReference(input: string): string | null {
   }
 }
 
-async function main() {
+export function createMcpServer() {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
   // ── 1. navigate_passage ──────────────────────────────────────────────────
@@ -656,23 +659,22 @@ async function main() {
   // ── 24. diagnose ──────────────────────────────────────────────────────────
   server.tool(
     "diagnose",
-    "Check the server's own environment: Logos data paths, database availability, and Biblia API configuration. Returns a diagnostic report. Use when other tools fail with missing-database or missing-key errors to pinpoint the setup problem.",
+    "Check path-free Logos data-source availability and Biblia API configuration. Use when other tools fail with missing-database or missing-key errors.",
     {},
     async () => {
       const lines: string[] = [];
       lines.push("## Logos MCP Environment Diagnostics\n");
 
-      lines.push(`**LOGOS_DATA_DIR**: \`${LOGOS_DATA_DIR}\``);
-      lines.push(`  ${existsSync(LOGOS_DATA_DIR) ? "OK" : "MISSING"}\n`);
+      lines.push("### Logos data locations\n");
+      lines.push(`Logos data directory: ${existsSync(LOGOS_DATA_DIR) ? "OK" : "MISSING"}\n`);
 
-      lines.push(`**LOGOS_CATALOG_DIR**: \`${LOGOS_CATALOG_DIR}\``);
-      lines.push(`  ${existsSync(LOGOS_CATALOG_DIR) ? "OK" : "MISSING"}\n`);
+      lines.push(`Library catalog directory: ${existsSync(LOGOS_CATALOG_DIR) ? "OK" : "MISSING"}\n`);
 
       lines.push("### Databases\n");
       for (const [name, path] of Object.entries(DB_PATHS)) {
         const found = existsSync(path);
         const icon = found ? "OK" : "MISSING";
-        lines.push(`- **${name}**: ${icon}  \`${path}\``);
+        lines.push(`- **${name}**: ${icon}`);
       }
 
       // existsSync alone can't catch an unloadable SQLite driver (e.g. a
@@ -681,15 +683,15 @@ async function main() {
       lines.push("### SQLite engine\n");
       const openable = Object.values(DB_PATHS).find((p) => existsSync(p));
       if (openable) {
+        let db: Database.Database | undefined;
         try {
-          const db = new Database(openable, { readonly: true, fileMustExist: true });
+          db = new Database(openable, { readonly: true, fileMustExist: true });
           db.prepare("SELECT 1").get();
-          db.close();
           lines.push("Opened a database successfully: OK");
-        } catch (e) {
-          const msg = e instanceof Error ? e.message.split("\n")[0] : String(e);
-          lines.push(`Cannot open databases: ${msg}`);
-          lines.push("(If this mentions ABI/NODE_MODULE_VERSION, run: npm rebuild better-sqlite3)");
+        } catch {
+          lines.push("Cannot open databases: ERROR");
+        } finally {
+          if (db?.open) db.close();
         }
       } else {
         lines.push("Skipped (no database files found).");
@@ -703,12 +705,13 @@ async function main() {
     }
   );
 
-  // ── Start server ─────────────────────────────────────────────────────────
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  registerProviderTools(server);
+  return server;
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  startConfiguredTransport(createMcpServer).catch((error) => {
+    console.error("Fatal error:", error instanceof Error ? error.message : "Server startup failed.");
+    process.exit(1);
+  });
+}
