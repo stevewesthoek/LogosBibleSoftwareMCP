@@ -51,10 +51,15 @@ export interface LogosCommandResult {
 // ─── SQLite / User Data Types ────────────────────────────────────────────────
 
 export interface HighlightResult {
+  sourceId?: string;
   resourceId: string;
   textRange: string;
   styleName: string;
   syncDate: string | null;
+  /** Parsed Bible location when present in the Logos anchor payload. */
+  anchorReference?: string | null;
+  /** Logos note annotation associated with the highlight, when present. */
+  annotation?: string | null;
   /** Human-readable title of the resource this highlight lives in (best-effort, null when the catalog is unavailable). */
   resourceTitle: string | null;
 }

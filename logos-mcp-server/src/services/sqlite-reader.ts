@@ -1,10 +1,11 @@
 import Database from "better-sqlite3";
 import { existsSync } from "fs";
 import { DB_PATHS } from "../config.js";
+import { formatCanonicalReference, parseLogosAnchorJson, parseLogosRawReference, referencesOverlap } from "../domain/logos-reference.js";
 import { stripRichText } from "../utils/strip-markup.js";
 import { decodeClippingBlob, extractClippingText } from "../utils/clippings.js";
 import { getResourceTitles } from "./catalog-reader.js";
-import { parseReference, resolveBookName } from "./reference-parser.js";
+import { extractBibleReferences } from "./reference-parser.js";
 import type {
   ClippingResult,
   HighlightResult,
@@ -30,117 +31,217 @@ function escapeLike(s: string): string {
 
 // ─── Highlights ──────────────────────────────────────────────────────────────
 
+export interface HighlightRetrievalResult {
+  items: HighlightResult[];
+  completeness: "complete" | "partial" | "unknown";
+  warnings: string[];
+  scanned: number;
+}
+
+const HIGHLIGHT_SCAN_LIMIT = 10_000;
+
 export function getUserHighlights(options: {
   resourceId?: string;
   styleName?: string;
+  query?: string;
+  passage?: string;
   limit?: number;
 } = {}): HighlightResult[] {
-  let results: HighlightResult[];
-  try {
-    results = queryVisualMarkupHighlights(options);
-  } catch {
-    // visualmarkup.db may be missing entirely on current installs.
-    results = [];
-  }
-  if (results.length === 0) {
-    // Modern Logos stores highlights as Kind=1 notes in notestool.db;
-    // visualmarkup.db is the legacy store and is empty on current installs.
-    results = getHighlightsFromNotes(options);
-  }
-  return withResourceTitles(results);
+  return getUserHighlightsWithStatus(options).items;
 }
 
-function queryVisualMarkupHighlights(options: {
+export function getUserHighlightsWithStatus(options: {
   resourceId?: string;
   styleName?: string;
+  query?: string;
+  passage?: string;
   limit?: number;
-}): HighlightResult[] {
-  const db = openDb(DB_PATHS.visualMarkup);
-  try {
-    let sql = "SELECT ResourceId, SavedTextRange, MarkupStyleName, SyncDate FROM Markup WHERE IsDeleted = 0";
-    const params: unknown[] = [];
-
-    if (options.resourceId) {
-      sql += " AND ResourceId = ?";
-      params.push(options.resourceId);
-    }
-    if (options.styleName) {
-      // LIKE to match the notestool fallback path's behavior for the same input.
-      sql += " AND MarkupStyleName LIKE ? ESCAPE '\\'";
-      params.push(`%${escapeLike(options.styleName)}%`);
-    }
-    sql += " ORDER BY SyncDate DESC";
-    if (options.limit) {
-      sql += " LIMIT ?";
-      params.push(options.limit);
-    }
-
-    const rows = db.prepare(sql).all(...params) as Array<{
-      ResourceId: string;
-      SavedTextRange: string;
-      MarkupStyleName: string;
-      SyncDate: string | null;
-    }>;
-
-    return rows.map((r) => ({
-      resourceId: r.ResourceId,
-      textRange: r.SavedTextRange,
-      styleName: r.MarkupStyleName,
-      syncDate: r.SyncDate,
-      resourceTitle: null, // filled in by withResourceTitles below
-    }));
-  } finally {
-    db.close();
+} = {}): HighlightRetrievalResult {
+  const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 50)));
+  if (options.passage && !referencesOverlap(options.passage, options.passage)) {
+    return { items: [], completeness: "unknown", warnings: ["reference_unresolved"], scanned: 0 };
   }
+
+  const scoped = Boolean(options.passage || options.query);
+  const candidateLimit = scoped ? Math.ceil(HIGHLIGHT_SCAN_LIMIT / 2) : limit + 1;
+  const warnings = new Set<string>();
+  let availableSources = 0;
+  const sourceResults: HighlightResult[][] = [];
+  const sourceTables = [
+    {
+      path: DB_PATHS.visualMarkup,
+      query: queryVisualMarkupHighlightsFromDatabase,
+      name: "visual_markup",
+    },
+    {
+      path: DB_PATHS.notes,
+      query: getHighlightsFromNotesDatabase,
+      name: "notes",
+    },
+  ] as const;
+  for (const source of sourceTables) {
+    if (!existsSync(source.path)) continue;
+    try {
+      const db = openDb(source.path);
+      try {
+        const rows = source.query(db, { ...options, limit: candidateLimit });
+        availableSources++;
+        sourceResults.push(rows);
+      } finally {
+        db.close();
+      }
+    } catch {
+      warnings.add(`${source.name}_highlight_source_unavailable`);
+    }
+  }
+  if (availableSources === 0) {
+    return {
+      items: [],
+      completeness: "unknown",
+      warnings: warnings.size > 0 ? [...warnings] : ["logos_database_unavailable"],
+      scanned: 0,
+    };
+  }
+
+  let results = sourceResults.flat().sort((left, right) =>
+    (right.syncDate ?? "").localeCompare(left.syncDate ?? ""),
+  );
+  const scanned = results.length;
+  if (scoped && sourceResults.some((rows) => rows.length >= candidateLimit)) {
+    warnings.add("candidate_scan_limit");
+  }
+  if (options.passage) {
+    results = results.filter((highlight) => {
+      const reference = highlight.anchorReference ?? parseAnchorReference(highlight.textRange);
+      if (!reference) {
+        warnings.add("reference_unresolved");
+        return false;
+      }
+      return referencesOverlap(reference, options.passage!);
+    });
+  }
+  if (options.query) {
+    const needle = options.query.toLocaleLowerCase();
+    results = results.filter((highlight) =>
+      highlight.styleName.toLocaleLowerCase().includes(needle) ||
+      highlight.annotation?.toLocaleLowerCase().includes(needle) === true,
+    );
+    if (results.some((highlight) => !highlight.annotation)) warnings.add("highlight_text_unavailable");
+  }
+
+  if (results.length > limit) warnings.add("result_limit_reached");
+  if (results.some((highlight) => !highlight.anchorReference)) warnings.add("reference_unresolved");
+  if (results.some((highlight) => !highlight.annotation)) warnings.add("highlight_text_unavailable");
+
+  const items = withResourceTitles(results.slice(0, limit));
+  return {
+    items,
+    completeness: warnings.size > 0 ? "partial" : "complete",
+    warnings: [...warnings],
+    scanned,
+  };
 }
 
-function getHighlightsFromNotes(options: {
-  resourceId?: string;
-  styleName?: string;
-  limit?: number;
-}): HighlightResult[] {
-  const db = openDb(DB_PATHS.notes);
-  try {
-    let sql = `
-      SELECT r.ResourceId, n.AnchorsJson, s.Name AS StyleName, n.ModifiedDate
-      FROM Notes n
-      LEFT JOIN NoteStyles s ON n.NoteStyleId = s.NoteStyleId
-      LEFT JOIN ResourceIds r ON n.AnchorResourceIdId = r.ResourceIdId
-      WHERE n.Kind = 1 AND n.IsDeleted = 0 AND n.IsTrashed = 0
-    `;
-    const params: unknown[] = [];
-
-    if (options.resourceId) {
-      sql += " AND r.ResourceId = ?";
-      params.push(options.resourceId);
-    }
-    if (options.styleName) {
-      sql += " AND s.Name LIKE ? ESCAPE '\\'";
-      params.push(`%${escapeLike(options.styleName)}%`);
-    }
-    sql += " ORDER BY n.ModifiedDate DESC";
-    if (options.limit) {
-      sql += " LIMIT ?";
-      params.push(options.limit);
-    }
-
-    const rows = db.prepare(sql).all(...params) as Array<{
-      ResourceId: string | null;
-      AnchorsJson: string | null;
-      StyleName: string | null;
-      ModifiedDate: string | null;
-    }>;
-
-    return rows.map((r) => ({
-      resourceId: r.ResourceId ?? "",
-      textRange: r.AnchorsJson ?? "",
-      styleName: r.StyleName ?? "",
-      syncDate: r.ModifiedDate,
-      resourceTitle: null, // filled in by withResourceTitles below
-    }));
-  } finally {
-    db.close();
+export function queryVisualMarkupHighlightsFromDatabase(
+  db: Database.Database,
+  options: { resourceId?: string; styleName?: string; query?: string; limit?: number },
+): HighlightResult[] {
+  let sql = "SELECT SyncId, ResourceId, SavedTextRange, MarkupStyleName, SyncDate FROM Markup WHERE IsDeleted = 0";
+  const params: unknown[] = [];
+  if (options.resourceId) {
+    sql += " AND ResourceId = ?";
+    params.push(options.resourceId);
   }
+  const styleQuery = options.styleName ?? options.query;
+  if (styleQuery) {
+    sql += " AND MarkupStyleName LIKE ? ESCAPE '\\'";
+    params.push(`%${escapeLike(styleQuery)}%`);
+  }
+  sql += " ORDER BY SyncDate DESC";
+  if (options.limit !== undefined) {
+    sql += " LIMIT ?";
+    params.push(options.limit);
+  }
+
+  const rows = db.prepare(sql).all(...params) as Array<{
+    SyncId: string | null;
+    ResourceId: string;
+    SavedTextRange: string;
+    MarkupStyleName: string;
+    SyncDate: string | null;
+  }>;
+  return rows.map((row) => ({
+    sourceId: row.SyncId ?? undefined,
+    resourceId: row.ResourceId,
+    textRange: row.SavedTextRange,
+    styleName: row.MarkupStyleName,
+    syncDate: row.SyncDate,
+    anchorReference: parseAnchorReference(row.SavedTextRange),
+    annotation: null,
+    resourceTitle: null,
+  }));
+}
+
+export function getHighlightsFromNotesDatabase(
+  db: Database.Database,
+  options: { resourceId?: string; styleName?: string; query?: string; limit?: number },
+): HighlightResult[] {
+  const hasFacetReferences = Boolean(db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'NoteAnchorFacetReferences'",
+  ).get());
+  let sql = `
+    SELECT n.NoteId, n.ExternalId, n.ContentRichText, n.AnchorsJson,
+           ${hasFacetReferences ? "f.Reference" : "NULL"} AS FacetReference,
+           r.ResourceId,
+           s.Name AS StyleName, n.ModifiedDate
+    FROM Notes n
+    LEFT JOIN NoteStyles s ON n.NoteStyleId = s.NoteStyleId
+    LEFT JOIN ResourceIds r ON n.AnchorResourceIdId = r.ResourceIdId
+    ${hasFacetReferences ? "LEFT JOIN NoteAnchorFacetReferences f ON f.NoteId = n.NoteId AND f.BibleBook IS NOT NULL" : ""}
+    WHERE n.Kind = 1 AND n.IsDeleted = 0 AND n.IsTrashed = 0
+  `;
+  const params: unknown[] = [];
+  if (options.resourceId) {
+    sql += " AND r.ResourceId = ?";
+    params.push(options.resourceId);
+  }
+  const styleQuery = options.styleName ?? options.query;
+  if (styleQuery) {
+    const pattern = `%${escapeLike(styleQuery)}%`;
+    sql += " AND (s.Name LIKE ? ESCAPE '\\' OR n.ContentRichText LIKE ? ESCAPE '\\')";
+    params.push(pattern, pattern);
+  }
+  sql += " ORDER BY n.ModifiedDate DESC, n.NoteId DESC";
+  if (options.limit !== undefined) {
+    sql += " LIMIT ?";
+    params.push(options.limit);
+  }
+
+  const rows = db.prepare(sql).all(...params) as Array<{
+    NoteId: number;
+    ExternalId: string | null;
+    ContentRichText: string | null;
+    AnchorsJson: string | null;
+    FacetReference: string | null;
+    ResourceId: string | null;
+    StyleName: string | null;
+    ModifiedDate: string | null;
+  }>;
+  return rows.map((row) => {
+    const facetReference = row.FacetReference ? parseLogosRawReference(row.FacetReference) : null;
+    return {
+      sourceId: row.ExternalId ?? String(row.NoteId),
+      resourceId: row.ResourceId ?? "",
+      textRange: row.FacetReference ?? row.AnchorsJson ?? "",
+      styleName: row.StyleName ?? "",
+      syncDate: row.ModifiedDate,
+      anchorReference: facetReference
+        ? formatCanonicalReference(facetReference)
+        : parseAnchorReference(row.AnchorsJson),
+      annotation: stripRichText(row.ContentRichText),
+      resourceTitle: null,
+    };
+  });
 }
 
 // Resolve resource titles lazily and batched: one catalog lookup per distinct
@@ -340,11 +441,55 @@ export function getReadingProgress(): ReadingProgress {
 export function getClippings(options: {
   resourceId?: string;
   tag?: string;
+  query?: string;
+  passage?: string;
   limit?: number;
 } = {}): ClippingResult[] {
+  return getClippingsWithStatus(options).items;
+}
+
+export function getClippingsWithStatus(options: {
+  resourceId?: string;
+  tag?: string;
+  query?: string;
+  passage?: string;
+  limit?: number;
+} = {}): ClippingRetrievalResult {
   const db = openDb(DB_PATHS.clippings);
   try {
-    let sql = `
+    return getClippingsFromDatabase(db, options);
+  } finally {
+    db.close();
+  }
+}
+
+export interface ClippingRetrievalResult {
+  items: ClippingResult[];
+  completeness: "complete" | "partial" | "unknown";
+  warnings: string[];
+  scanned: number;
+}
+
+const CLIPPING_PAGE_SIZE = 200;
+const CLIPPING_SCAN_LIMIT = 10_000;
+
+/** Query a caller-owned database for fixture tests; the production opener is read-only. */
+export function getClippingsFromDatabase(
+  db: Database.Database,
+  options: {
+    resourceId?: string;
+    tag?: string;
+    query?: string;
+    passage?: string;
+    limit?: number;
+  } = {},
+): ClippingRetrievalResult {
+  const limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 20)));
+  if (options.passage && !referencesOverlap(options.passage, options.passage)) {
+    return { items: [], completeness: "unknown", warnings: ["reference_unresolved"], scanned: 0 };
+  }
+
+  let sql = `
       SELECT c.RowId, c.ResourceId, c.CreatedDate, c.Title as TitleBlob,
              c.Content as ContentBlob, c.Notes as NotesBlob, c.Tags,
              cd.Title as CollectionTitle
@@ -352,26 +497,30 @@ export function getClippings(options: {
       LEFT JOIN ClippingsDocuments cd ON c.DocumentRowId = cd.RowId
       WHERE (cd.IsDeleted = 0 OR cd.IsDeleted IS NULL)
     `;
-    const params: unknown[] = [];
+  const params: unknown[] = [];
 
-    if (options.resourceId) {
-      sql += " AND c.ResourceId = ?";
-      params.push(options.resourceId);
-    }
+  if (options.resourceId) {
+    sql += " AND c.ResourceId = ?";
+    params.push(options.resourceId);
+  }
 
-    if (options.tag) {
-      sql += " AND c.Tags LIKE ? ESCAPE '\\'";
-      params.push(`%${escapeLike(options.tag)}%`);
-    }
+  if (options.tag) {
+    sql += " AND c.Tags LIKE ? ESCAPE '\\'";
+    params.push(`%${escapeLike(options.tag)}%`);
+  }
 
-    sql += " ORDER BY c.CreatedDate DESC";
+  sql += " ORDER BY c.CreatedDate DESC, c.RowId DESC";
 
-    if (options.limit) {
-      sql += " LIMIT ?";
-      params.push(options.limit);
-    }
+  const pageQuery = db.prepare(`${sql} LIMIT ? OFFSET ?`);
+  const result: ClippingResult[] = [];
+  const warnings = new Set<string>();
+  let scanned = 0;
+  let offset = 0;
+  let hasMoreRows = false;
 
-    const rows = db.prepare(sql).all(...params) as Array<{
+  while (scanned < CLIPPING_SCAN_LIMIT) {
+    const currentPageSize = Math.min(CLIPPING_PAGE_SIZE, CLIPPING_SCAN_LIMIT - scanned);
+    const rows = pageQuery.all(...params, currentPageSize, offset) as Array<{
       RowId: number;
       ResourceId: string;
       CreatedDate: string;
@@ -382,7 +531,12 @@ export function getClippings(options: {
       CollectionTitle: string | null;
     }>;
 
-    return rows.map((r) => ({
+    if (rows.length === 0) {
+      hasMoreRows = false;
+      break;
+    }
+
+    const mapped = rows.map((r) => ({
       rowId: r.RowId,
       resourceId: r.ResourceId,
       createdDate: r.CreatedDate,
@@ -392,9 +546,48 @@ export function getClippings(options: {
       notes: extractClippingText(decodeClippingBlob(r.NotesBlob)),
       tags: r.Tags,
     }));
-  } finally {
-    db.close();
+    let matches = mapped;
+    if (options.query) {
+      const needle = options.query.toLocaleLowerCase();
+      matches = matches.filter((item) => [item.title, item.content, item.notes, item.tags, item.collectionTitle, item.resourceId]
+        .some((value) => value?.toLocaleLowerCase().includes(needle)));
+    }
+    if (options.passage) {
+      matches = matches.filter((item) => {
+        const references = extractBibleReferences(`${item.tags ?? ""}\n${item.title ?? ""}\n${item.content ?? ""}`);
+        if (references.length === 0) {
+          warnings.add("reference_unresolved");
+          return false;
+        }
+        return references.some((reference) => referencesOverlap(reference, options.passage!));
+      });
+    }
+
+    result.push(...matches);
+    scanned += rows.length;
+    offset += rows.length;
+    if (result.length > limit) {
+      hasMoreRows = true;
+      break;
+    }
+    if (rows.length < currentPageSize) {
+      hasMoreRows = false;
+      break;
+    }
+    hasMoreRows = true;
   }
+
+  if (result.length > limit) warnings.add("result_limit_reached");
+  if (scanned >= CLIPPING_SCAN_LIMIT && hasMoreRows && result.length <= limit) {
+    warnings.add("candidate_scan_limit");
+  }
+
+  return {
+    items: result.slice(0, limit),
+    completeness: warnings.size > 0 ? "partial" : "complete",
+    warnings: [...warnings],
+    scanned,
+  };
 }
 
 // ─── Notes ───────────────────────────────────────────────────────────────────
@@ -414,15 +607,66 @@ export interface NoteResult {
   tags: string[];
 }
 
+export interface NoteRetrievalResult {
+  items: NoteResult[];
+  completeness: "complete" | "partial" | "unknown";
+  warnings: string[];
+  scanned: number;
+}
+
+const NOTE_PAGE_SIZE = 250;
+const NOTE_SCAN_LIMIT = 10_000;
+const MAX_NOTE_RESULTS = 100;
+
+function boundedNoteLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return 20;
+  return Math.max(1, Math.min(MAX_NOTE_RESULTS, Math.floor(limit)));
+}
+
 export function getUserNotes(options: {
   notebookTitle?: string;
   limit?: number;
   query?: string;
   passage?: string;
 } = {}): NoteResult[] {
+  return getUserNotesWithStatus(options).items;
+}
+
+export function getUserNotesWithStatus(options: {
+  notebookTitle?: string;
+  limit?: number;
+  query?: string;
+  passage?: string;
+} = {}): NoteRetrievalResult {
   const db = openDb(DB_PATHS.notes);
   try {
-    let sql = `
+    return getUserNotesFromDatabase(db, options);
+  } finally {
+    db.close();
+  }
+}
+
+/** Query a caller-owned database; exported so the SQL and filtering contract can be fixture-tested. */
+export function getUserNotesFromDatabase(
+  db: Database.Database,
+  options: {
+    notebookTitle?: string;
+    limit?: number;
+    query?: string;
+    passage?: string;
+  } = {},
+): NoteRetrievalResult {
+  const limit = boundedNoteLimit(options.limit);
+  if (options.passage && !referencesOverlap(options.passage, options.passage)) {
+    return {
+      items: [],
+      completeness: "unknown",
+      warnings: ["reference_unresolved"],
+      scanned: 0,
+    };
+  }
+
+  let sql = `
       SELECT n.NoteId, n.ExternalId, n.ContentRichText, n.CreatedDate,
              n.ModifiedDate, nb.Title as NotebookTitle,
              n.AnchorsJson, n.TagsJson
@@ -431,26 +675,33 @@ export function getUserNotes(options: {
       WHERE n.IsDeleted = 0 AND n.IsTrashed = 0
         AND n.ContentRichText IS NOT NULL
     `;
-    const params: unknown[] = [];
+  const params: unknown[] = [];
 
-    if (options.notebookTitle) {
-      sql += " AND nb.Title LIKE ? ESCAPE '\\'";
-      params.push(`%${escapeLike(options.notebookTitle)}%`);
-    }
+  if (options.notebookTitle) {
+    sql += " AND nb.Title LIKE ? ESCAPE '\\'";
+    params.push(`%${escapeLike(options.notebookTitle)}%`);
+  }
 
-    if (options.query) {
-      sql += " AND n.ContentRichText LIKE ? ESCAPE '\\'";
-      params.push(`%${escapeLike(options.query)}%`);
-    }
+  if (options.query) {
+    sql += " AND (n.ContentRichText LIKE ? ESCAPE '\\' OR nb.Title LIKE ? ESCAPE '\\' OR n.TagsJson LIKE ? ESCAPE '\\')";
+    const query = `%${escapeLike(options.query)}%`;
+    params.push(query, query, query);
+  }
 
-    sql += " ORDER BY n.ModifiedDate DESC";
+  sql += " ORDER BY n.ModifiedDate DESC, n.NoteId DESC";
 
-    if (options.limit) {
-      sql += " LIMIT ?";
-      params.push(options.limit);
-    }
+  const pageSize = options.passage ? NOTE_PAGE_SIZE : limit + 1;
+  const scanLimit = options.passage ? NOTE_SCAN_LIMIT : limit + 1;
+  const pageQuery = db.prepare(`${sql} LIMIT ? OFFSET ?`);
+  const results: NoteResult[] = [];
+  const warnings = new Set<string>();
+  let scanned = 0;
+  let offset = 0;
+  let hasMoreRows = false;
 
-    const rows = db.prepare(sql).all(...params) as Array<{
+  while (scanned < scanLimit) {
+    const currentPageSize = Math.min(pageSize, scanLimit - scanned);
+    const rows = pageQuery.all(...params, currentPageSize, offset) as Array<{
       NoteId: number;
       ExternalId: string;
       ContentRichText: string | null;
@@ -460,6 +711,10 @@ export function getUserNotes(options: {
       AnchorsJson: string | null;
       TagsJson: string | null;
     }>;
+    if (rows.length === 0) {
+      hasMoreRows = false;
+      break;
+    }
 
     const notes = rows
       .map((r) => ({
@@ -476,31 +731,45 @@ export function getUserNotes(options: {
       }))
       .filter((n) => n.content !== null);
 
-    return filterNotesByPassage(notes, options.passage);
-  } finally {
-    db.close();
-  }
-}
+    let matches = notes;
+    if (options.passage) {
+      matches = notes.filter((note) => {
+        if (!note.anchorReference) {
+          warnings.add("reference_unresolved");
+          return false;
+        }
+        return referencesOverlap(note.anchorReference, options.passage!);
+      });
+    }
+    results.push(...matches);
+    scanned += rows.length;
+    offset += rows.length;
 
-// Post-filter notes by the book name of a passage string (e.g. "John 3:16" ->
-// keep notes whose anchorReference mentions "John"). Case-insensitive; when the
-// passage's book name can't be resolved the filter is skipped entirely.
-function filterNotesByPassage(notes: NoteResult[], passage?: string): NoteResult[] {
-  if (!passage) return notes;
-  const book = extractBookName(passage);
-  if (!book) return notes;
-  const needle = book.toLowerCase();
-  return notes.filter((n) => n.anchorReference?.toLowerCase().includes(needle));
-}
-
-function extractBookName(passage: string): string | null {
-  try {
-    return parseReference(passage).book;
-  } catch {
-    // Not a full reference (e.g. just "John" or "1 John") — try resolving the
-    // raw string as a book name.
-    return resolveBookName(passage);
+    if (results.length > limit) {
+      hasMoreRows = true;
+      break;
+    }
+    if (rows.length < currentPageSize) {
+      hasMoreRows = false;
+      break;
+    }
+    hasMoreRows = true;
   }
+
+  const items = results.slice(0, limit);
+  if (results.length > limit || (!options.passage && hasMoreRows)) {
+    warnings.add("result_limit_reached");
+  }
+  if (options.passage && scanned >= scanLimit && hasMoreRows && results.length <= limit) {
+    warnings.add("candidate_scan_limit");
+  }
+
+  return {
+    items,
+    completeness: warnings.size > 0 ? "partial" : "complete",
+    warnings: [...warnings],
+    scanned,
+  };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -515,88 +784,14 @@ function safeParseArray(json: string | null): string[] {
   }
 }
 
-// ─── Anchor / Tag JSON parsing ───────────────────────────────────────────────
-
-// Logos Bible book numbers (standard Protestant canon order, 1-66). Numbers
-// outside this range (e.g. deuterocanonical books in some installs) are left
-// unmapped and parse to null — best-effort only.
-const BOOKS_BY_NUMBER: Record<number, string> = {
-  1: "Genesis", 2: "Exodus", 3: "Leviticus", 4: "Numbers", 5: "Deuteronomy",
-  6: "Joshua", 7: "Judges", 8: "Ruth", 9: "1 Samuel", 10: "2 Samuel",
-  11: "1 Kings", 12: "2 Kings", 13: "1 Chronicles", 14: "2 Chronicles",
-  15: "Ezra", 16: "Nehemiah", 17: "Esther", 18: "Job", 19: "Psalms",
-  20: "Proverbs", 21: "Ecclesiastes", 22: "Song of Solomon", 23: "Isaiah",
-  24: "Jeremiah", 25: "Lamentations", 26: "Ezekiel", 27: "Daniel",
-  28: "Hosea", 29: "Joel", 30: "Amos", 31: "Obadiah", 32: "Jonah",
-  33: "Micah", 34: "Nahum", 35: "Habakkuk", 36: "Zephaniah", 37: "Haggai",
-  38: "Zechariah", 39: "Malachi", 40: "Matthew", 41: "Mark", 42: "Luke",
-  43: "John", 44: "Acts", 45: "Romans", 46: "1 Corinthians",
-  47: "2 Corinthians", 48: "Galatians", 49: "Ephesians", 50: "Philippians",
-  51: "Colossians", 52: "1 Thessalonians", 53: "2 Thessalonians",
-  54: "1 Timothy", 55: "2 Timothy", 56: "Titus", 57: "Philemon",
-  58: "Hebrews", 59: "James", 60: "1 Peter", 61: "2 Peter", 62: "1 John",
-  63: "2 John", 64: "3 John", 65: "Jude", 66: "Revelation",
-};
-
-// Matches raw Logos reference strings found in AnchorsJson, e.g.:
-//   "bible.44.3.21"              -> Acts 3:21
-//   "bible.44.3.21-44.3.23"      -> Acts 3:21-23
-//   "bible+kjv.6.1.8"            -> Joshua 1:8 (version qualifier ignored)
-const BIBLE_RAW_RE =
-  /^bible(?:\+[a-z0-9]*)?\.(\d+)\.(\d+)(?:\.(\d+))?(?:-(\d+)\.(\d+)(?:\.(\d+))?)?$/i;
-
 // Best-effort human-readable Bible reference from a note's AnchorsJson.
 // Returns null when the JSON is missing/malformed or no bible reference anchor
 // is found. Never throws.
 export function parseAnchorReference(anchorsJson: string | null): string | null {
-  if (!anchorsJson) return null;
-  let anchors: unknown;
-  try {
-    anchors = JSON.parse(anchorsJson);
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(anchors)) return null;
-
-  for (const anchor of anchors) {
-    if (typeof anchor !== "object" || anchor === null) continue;
-    const reference = (anchor as Record<string, unknown>).reference;
-    if (typeof reference !== "object" || reference === null) continue;
-    const raw = (reference as Record<string, unknown>).raw;
-    if (typeof raw !== "string") continue;
-    const human = bibleRawToHuman(raw);
-    if (human) return human;
-  }
-  return null;
+  return parseLogosAnchorJson(anchorsJson);
 }
 
-function bibleRawToHuman(raw: string): string | null {
-  const m = raw.match(BIBLE_RAW_RE);
-  if (!m) return null;
-  const book = BOOKS_BY_NUMBER[parseInt(m[1], 10)];
-  if (!book) return null;
-
-  const chapter = parseInt(m[2], 10);
-  const verse = m[3] ? parseInt(m[3], 10) : undefined;
-  const endBook = m[4] ? BOOKS_BY_NUMBER[parseInt(m[4], 10)] : undefined;
-  const endChapter = m[5] ? parseInt(m[5], 10) : undefined;
-  const endVerse = m[6] ? parseInt(m[6], 10) : undefined;
-
-  let result = `${book} ${chapter}`;
-  if (verse !== undefined) result += `:${verse}`;
-  if (endChapter !== undefined) {
-    if (endBook !== undefined && endBook !== book) {
-      // Cross-book range, e.g. "bible.1.50.26-2.1.1" -> Genesis 50:26-Exodus 1:1
-      result += `-${endBook} ${endChapter}`;
-      if (endVerse !== undefined) result += `:${endVerse}`;
-    } else if (endVerse !== undefined) {
-      result += endChapter === chapter ? `-${endVerse}` : `-${endChapter}:${endVerse}`;
-    } else {
-      result += `-${endChapter}`;
-    }
-  }
-  return result;
-}
+// ─── Anchor / Tag JSON parsing ───────────────────────────────────────────────
 
 // Tags from a note's TagsJson, e.g. [{"plain":{"text":"faith"}}] -> ["faith"].
 // Returns an empty array when the JSON is missing/malformed. Never throws.

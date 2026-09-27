@@ -5,6 +5,7 @@ import {
   toBibliaRef,
   toHumanReadable,
   expandRange,
+  extractBibleReferences,
 } from "../src/services/reference-parser.js";
 
 describe("parseReference", () => {
@@ -175,6 +176,18 @@ describe("parseReference", () => {
       const ref = parseReference("Genesis   1:1");
       expect(ref).toEqual({ book: "Genesis", chapter: 1, verse: 1 });
     });
+  });
+});
+
+describe("extractBibleReferences", () => {
+  it("extracts full names, abbreviations, and numbered books from text", () => {
+    expect(extractBibleReferences("Jas 1:2-4; 2 Cor 5:11-21; Psalm 98"))
+      .toEqual(["Jas 1:2-4", "2 Cor 5:11-21", "Psalm 98"]);
+  });
+
+  it("returns no references for empty or unrelated text", () => {
+    expect(extractBibleReferences(null)).toEqual([]);
+    expect(extractBibleReferences("A short clipping without references.")).toEqual([]);
   });
 });
 

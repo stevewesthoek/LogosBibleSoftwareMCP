@@ -9,26 +9,26 @@ import {
 
 describe("parseAnchorReference", () => {
   it("parses a simple bible reference anchor", () => {
-    expect(parseAnchorReference('[{"reference":{"raw":"bible.44.3.21"}}]')).toBe(
+    expect(parseAnchorReference('[{"reference":{"raw":"bible.65.3.21"}}]')).toBe(
       "Acts 3:21"
     );
   });
 
   it("parses a verse range within one chapter", () => {
     expect(
-      parseAnchorReference('[{"reference":{"raw":"bible.44.3.21-44.3.23"}}]')
+      parseAnchorReference('[{"reference":{"raw":"bible.65.3.21-65.3.23"}}]')
     ).toBe("Acts 3:21-23");
   });
 
   it("parses a cross-chapter range", () => {
     expect(
-      parseAnchorReference('[{"reference":{"raw":"bible.44.3.21-44.4.5"}}]')
+      parseAnchorReference('[{"reference":{"raw":"bible.65.3.21-65.4.5"}}]')
     ).toBe("Acts 3:21-4:5");
   });
 
   it("parses a cross-book range without dropping the end book", () => {
     expect(
-      parseAnchorReference('[{"reference":{"raw":"bible.44.3.21-45.4.5"}}]')
+      parseAnchorReference('[{"reference":{"raw":"bible.65.3.21-66.4.5"}}]')
     ).toBe("Acts 3:21-Romans 4:5");
   });
 
@@ -49,7 +49,7 @@ describe("parseAnchorReference", () => {
 
   it("returns the first bible reference when multiple anchors exist", () => {
     const json =
-      '[{"workflow":{"templateId":"WORKFLOW:BASIC-BIBLICAL-TOPIC-STUDY","workflowKey":"bk.%GiftsOfTheHolySpirit","responseId":"08C0D3E2B51D93DBF5AD1F399A38967B"}},{"reference":{"raw":"bible.44.3.21-44.3.23"}}]';
+      '[{"workflow":{"templateId":"WORKFLOW:BASIC-BIBLICAL-TOPIC-STUDY","workflowKey":"bk.%GiftsOfTheHolySpirit","responseId":"08C0D3E2B51D93DBF5AD1F399A38967B"}},{"reference":{"raw":"bible.65.3.21-65.3.23"}}]';
     expect(parseAnchorReference(json)).toBe("Acts 3:21-23");
   });
 
@@ -65,9 +65,10 @@ describe("parseAnchorReference", () => {
     ).toBeNull();
   });
 
-  it("returns null for out-of-range book numbers (e.g. deuterocanonical)", () => {
-    expect(parseAnchorReference('[{"reference":{"raw":"bible.67.1.18"}}]')).toBeNull();
-    expect(parseAnchorReference('[{"reference":{"raw":"bible.80.1.3"}}]')).toBeNull();
+  it("returns null for unverified book numbers and unsupported numbering gaps", () => {
+    expect(parseAnchorReference('[{"reference":{"raw":"bible.40.1.18"}}]')).toBeNull();
+    expect(parseAnchorReference('[{"reference":{"raw":"bible.60.1.3"}}]')).toBeNull();
+    expect(parseAnchorReference('[{"reference":{"raw":"bible.88.1.3"}}]')).toBeNull();
   });
 
   it("returns null for null/empty/malformed JSON", () => {

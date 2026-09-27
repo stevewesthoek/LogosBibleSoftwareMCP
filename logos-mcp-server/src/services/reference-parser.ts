@@ -88,7 +88,9 @@ const ALIAS_TO_BOOK: Record<string, string> = {
   "Josh": "Joshua",
   "Judg": "Judges",
   "1Sam": "1 Samuel",
+  "1 Sam": "1 Samuel",
   "2Sam": "2 Samuel",
+  "2 Sam": "2 Samuel",
   "1Kgs": "1 Kings",
   "2Kgs": "2 Kings",
   "1Chr": "1 Chronicles",
@@ -121,7 +123,9 @@ const ALIAS_TO_BOOK: Record<string, string> = {
   "Joh": "John",
   "Rom": "Romans",
   "1Cor": "1 Corinthians",
+  "1 Cor": "1 Corinthians",
   "2Cor": "2 Corinthians",
+  "2 Cor": "2 Corinthians",
   "Gal": "Galatians",
   "Phil": "Philippians",
   "1Thess": "1 Thessalonians",
@@ -132,7 +136,9 @@ const ALIAS_TO_BOOK: Record<string, string> = {
   "Phlm": "Philemon",
   "Jas": "James",
   "1Pet": "1 Peter",
+  "1 Pet": "1 Peter",
   "2Pet": "2 Peter",
+  "2 Pet": "2 Peter",
   "Rev": "Revelation",
 };
 
@@ -152,6 +158,31 @@ for (const [alias, canonical] of Object.entries(ALIAS_TO_BOOK)) {
 // Add Logos abbreviations as aliases too
 for (const [abbr, canonical] of Object.entries(LOGOS_TO_BOOK)) {
   NAME_LOOKUP.set(abbr.toLowerCase(), canonical);
+}
+
+const REFERENCE_BOOK_PATTERN = [...NAME_LOOKUP.keys()]
+  .sort((left, right) => right.length - left.length)
+  .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s*"))
+  .join("|");
+const REFERENCE_IN_TEXT = new RegExp(
+  `(?<![A-Za-z0-9])(?:${REFERENCE_BOOK_PATTERN})\\s+\\d+(?::\\d+)?(?:\\s*[-–]\\s*\\d+(?::\\d+)?)?`,
+  "gi",
+);
+
+/** Extract parseable Bible references embedded in Logos clipping tags or text. */
+export function extractBibleReferences(input: string | null | undefined): string[] {
+  if (!input) return [];
+  const references = new Set<string>();
+  for (const match of input.matchAll(REFERENCE_IN_TEXT)) {
+    const candidate = match[0].trim();
+    try {
+      parseReference(candidate);
+      references.add(candidate);
+    } catch {
+      // Ignore text that resembles a reference but is not valid in this parser.
+    }
+  }
+  return [...references];
 }
 
 // Single-chapter books: when user writes "Jude 4", it means chapter 1 verse 4
